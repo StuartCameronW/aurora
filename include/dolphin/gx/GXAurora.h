@@ -24,6 +24,12 @@ extern "C" {
 #define GX_AURORA_LOAD_SCISSOR_RENDER 0x0002
 
 /**
+ * Loads a full 4x4 projection matrix, bypassing GXSetProjection's 6-parameter
+ * hardware encoding. Must be followed by sixteen f32 values in row-major order.
+ */
+#define GX_AURORA_LOAD_PROJECTION_FULL 0x0003
+
+/**
  * Aurora equivalent of CP_REG_ARRAYBASE_ID: sets the base address and size of a vertex array.
  * This command must be followed by a 64-bit memory address, 32-bit size, and 1-byte little-endian flag.
  * The index of the vertex array is given by the lowest 4 bits of the command ID,
@@ -131,6 +137,11 @@ void AuroraSetViewportPolicy(AuroraViewportPolicy policy);
 void AuroraGetRenderSize(u32* width, u32* height);
 
 /**
+ * Flush pending GX state and wait for FIFO processing without signaling a draw-done callback.
+ */
+void AuroraGXSync(void);
+
+/**
  * Sets the actual render viewport in native framebuffer coordinates.
  * Overrides the automatically scaled values set by the logical GXSetViewport.
  */
@@ -143,6 +154,11 @@ void GXSetViewportRender(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz)
 void GXSetScissorRender(u32 left, u32 top, u32 wd, u32 ht);
 
 void GX2SetPolygonOffset(f32 mFrontOffset, f32 mFrontScale, f32 mBackOffset, f32 mBackScale, f32 mClamp);
+
+/**
+ * Load an arbitrary 4x4 projection matrix, avoiding the 6-parameter hardware encoding.
+ */
+void GXSetProjectionFull(const void* mtx);
 
 /**
  * Create an offscreen framebuffer and switch rendering to it.

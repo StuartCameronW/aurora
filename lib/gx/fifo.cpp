@@ -1,15 +1,18 @@
 #include "fifo.hpp"
+
+#include "../thread.hpp"
 #include "command_processor.hpp"
-#include "../internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
+
+#include <tracy/Tracy.hpp>
 
 namespace aurora::gx::fifo {
-static Module Log("aurora::gx::fifo");
-
 namespace detail {
 uint8_t* sBufferData = nullptr;
 uint32_t sBufferSize = 0;
@@ -20,16 +23,128 @@ uint32_t sDlSize = 0;
 uint32_t sDlWritePos = 0;
 } // namespace detail
 
+namespace {
+constexpr Module Log{"aurora::gx::fifo"};
+constexpr auto kProcessingMode = ProcessingMode::Thread;
+constexpr uint32_t kDrawBatchSize = 1;
+
+bool sFrameActive = false;
+uint32_t sPendingDraws = 0;
+std::atomic<uint64_t> sPublished{0};
+std::atomic<uint64_t> sProcessed{0};
+uint64_t sStreamBase = 0;
+std::mutex sBufferMutex;
+std::atomic<uint32_t> sWorkerWake{0};
+thread::Thread sWorkerThread;
+std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
+
+void dispatch_draw_done() noexcept {
+  if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
+    callback();
+  }
+}
+
+void wake_worker() noexcept {
+  sWorkerWake.fetch_add(1, std::memory_order_release);
+  sWorkerWake.notify_all();
+}
+
+void process_to(uint64_t target, std::memory_order order) noexcept {
+  uint64_t processed = sProcessed.load(std::memory_order_relaxed);
+  while (processed < target) {
+    ProcessResult result{};
+    {
+      std::lock_guard lock{sBufferMutex};
+      AURORA_ASSERT(processed >= sStreamBase && target <= sStreamBase + detail::sBufferSize,
+                    "FIFO processing range [{}, {}) is outside buffered range [{}, {})", processed, target, sStreamBase,
+                    sStreamBase + detail::sBufferSize);
+      const auto start = static_cast<uint32_t>(processed - sStreamBase);
+      const auto size = static_cast<uint32_t>(target - processed);
+      result = process(detail::sBufferData + start, size);
+    }
+    AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
+                  "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
+                  target - processed);
+    if (result.drawDone) {
+      dispatch_draw_done();
+    }
+    processed += result.bytesProcessed;
+    sProcessed.store(processed, order);
+    sProcessed.notify_all();
+  }
+}
+
+void worker_main(std::stop_token token) noexcept {
+  std::stop_callback wakeOnStop{token, wake_worker};
+  while (true) {
+    const uint32_t event = sWorkerWake.load(std::memory_order_acquire);
+    const uint64_t processed = sProcessed.load(std::memory_order_relaxed);
+    const uint64_t published = sPublished.load(std::memory_order_acquire);
+    if (published != processed) {
+      process_to(published, std::memory_order_release);
+      continue;
+    }
+
+    if (token.stop_requested()) {
+      break;
+    }
+    sWorkerWake.wait(event, std::memory_order_acquire);
+  }
+}
+
+void start_worker() {
+  if (kProcessingMode != ProcessingMode::Thread || sWorkerThread.joinable()) {
+    return;
+  }
+  sWorkerThread = thread::Thread{{
+                                     .name = "Aurora FIFO processor",
+                                     .affinity = thread::Affinity::SharedCache,
+                                 },
+                                 worker_main};
+}
+
+void stop_worker() {
+  if (!sWorkerThread.joinable()) {
+    return;
+  }
+  sWorkerThread.request_stop();
+  sWorkerThread.join();
+}
+} // namespace
+
+ProcessingMode processing_mode() noexcept { return kProcessingMode; }
+
 void init() {
+  stop_worker();
+
   constexpr uint32_t initialCapacity = 64 * 1024;
   free(detail::sBufferData);
   detail::sBufferData = static_cast<uint8_t*>(malloc(initialCapacity));
+  AURORA_ASSERT(detail::sBufferData != nullptr, "fifo::init: failed to allocate {} bytes", initialCapacity);
   detail::sBufferSize = 0;
   detail::sBufferCapacity = initialCapacity;
   detail::sInDisplayList = false;
   detail::sDlBuffer = nullptr;
   detail::sDlSize = 0;
   detail::sDlWritePos = 0;
+
+  sFrameActive = false;
+  sPendingDraws = 0;
+  sStreamBase = 0;
+  sPublished.store(0, std::memory_order_relaxed);
+  sProcessed.store(0, std::memory_order_relaxed);
+  sWorkerWake.store(0, std::memory_order_relaxed);
+
+  start_worker();
+}
+
+void shutdown() { stop_worker(); }
+
+void begin_frame() noexcept { sFrameActive = true; }
+
+void end_frame() noexcept {
+  sFrameActive = false;
+  clear_draw_cache(); // command_processor
 }
 
 /**
@@ -46,7 +161,8 @@ void init() {
  * memory, just pegging a core. It was diagnosed only by reading these two globals out of a live
  * hung process, which is a bad way to find out.
  *
- * So: compute in 64-bit, bound the result, and check the allocation.
+ * So: compute in 64-bit, bound the result, and check the allocation. (Upstream has since adopted
+ * the 64-bit arithmetic and the checked realloc; the MEM1 bound is what this fork still adds.)
  *
  * The bound is the emulated console's own MEM1 size rather than a number invented here. A frame's
  * command stream cannot legitimately exceed the entire RAM of the machine being emulated - real
@@ -56,37 +172,74 @@ void init() {
  * can address.
  */
 void write_data_grow(const void* data, uint32_t length) {
-  const uint64_t needed = static_cast<uint64_t>(detail::sBufferSize) + length;
-  const uint64_t limit =
-      g_config.mem1Size != 0 ? static_cast<uint64_t>(g_config.mem1Size) : UINT32_MAX;
-
-  if (needed > limit) {
+  const uint64_t needed64 = static_cast<uint64_t>(detail::sBufferSize) + length;
+  // Dusk fork: bound the stream at the emulated console's MEM1, not at what uint32 can address.
+  // Upstream's own 64-bit fix stops the overflow, but with a 4 GiB ceiling a runaway draw loop still
+  // gets to allocate and memcpy gigabytes before it is noticed; MEM1 is the real ceiling.
+  const uint64_t limit = g_config.mem1Size != 0 ? static_cast<uint64_t>(g_config.mem1Size)
+                                                : std::numeric_limits<uint32_t>::max();
+  if (needed64 > limit) {
     // Fatal on purpose. Returning would silently drop commands and draw a corrupt frame, and
     // carrying on is what produced the original hang. Say which frame died and stop.
     FATAL("gx::fifo: command stream reached {} bytes, past the {} byte limit - a draw loop is not "
           "terminating (a cycle in a draw-buffer packet list will do this). Refusing to grow.",
-          needed, limit);
+          needed64, limit);
   }
-
-  const uint64_t doubled = static_cast<uint64_t>(detail::sBufferCapacity) * 2;
-  const uint64_t newCap = std::min(std::max(doubled, needed), limit);
-
-  auto* grown = static_cast<uint8_t*>(realloc(detail::sBufferData, newCap));
-  if (grown == nullptr) {
-    // realloc leaves the original block valid, so the old pointer is still live - but there is no
-    // way forward, and the previous code dereferenced the null straight away.
-    FATAL("gx::fifo: out of memory growing the command stream to {} bytes", newCap);
+  const auto needed = static_cast<uint32_t>(needed64);
+  const auto doubledCapacity = static_cast<uint64_t>(detail::sBufferCapacity) * 2;
+  const auto newCapacity = static_cast<uint32_t>(std::min(std::max(doubledCapacity, needed64), limit));
+  const auto grow = [newCapacity] {
+    auto* resized = static_cast<uint8_t*>(realloc(detail::sBufferData, newCapacity));
+    AURORA_ASSERT(resized != nullptr, "fifo::write_data: failed to allocate {} bytes", newCapacity);
+    detail::sBufferData = resized;
+  };
+  if (sWorkerThread.joinable()) {
+    std::lock_guard lock{sBufferMutex};
+    grow();
+  } else {
+    grow();
   }
-
-  detail::sBufferData = grown;
   std::memcpy(detail::sBufferData + detail::sBufferSize, data, length);
-  detail::sBufferSize = static_cast<uint32_t>(needed);
-  detail::sBufferCapacity = static_cast<uint32_t>(newCap);
+  detail::sBufferSize = needed;
+  detail::sBufferCapacity = newCapacity;
 }
 
-void patch_u32(const uint32_t offset, const uint32_t val) {
-  ASSERT(!detail::sInDisplayList && offset + sizeof(uint32_t) <= detail::sBufferSize,
-         "fifo::patch_u32: invalid patch offset {} (buffer size {})", offset, detail::sBufferSize);
+void publish() noexcept {
+  if (!sFrameActive || kProcessingMode == ProcessingMode::Drain || detail::sInDisplayList) {
+    return;
+  }
+
+  const uint64_t target = sStreamBase + detail::sBufferSize;
+  if (target > sPublished.load(std::memory_order_relaxed)) {
+    sPendingDraws = 0;
+    sPublished.store(target, std::memory_order_release);
+    if (kProcessingMode == ProcessingMode::Thread) {
+      wake_worker();
+    } else {
+      process_to(target, std::memory_order_relaxed);
+    }
+  }
+}
+
+DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept {
+  return sDrawDoneCallback.exchange(callback, std::memory_order_acq_rel);
+}
+
+void finish_draw() noexcept {
+  if (!sFrameActive || kProcessingMode == ProcessingMode::Drain || detail::sInDisplayList) {
+    return;
+  }
+  if (++sPendingDraws >= kDrawBatchSize) {
+    publish();
+  }
+}
+
+void patch_u32(uint32_t offset, uint32_t val) {
+  AURORA_ASSERT(!detail::sInDisplayList && offset <= detail::sBufferSize &&
+                    sizeof(uint32_t) <= detail::sBufferSize - offset,
+                "fifo::patch_u32: invalid patch offset {} (buffer size {})", offset, detail::sBufferSize);
+  AURORA_ASSERT(sStreamBase + offset >= sPublished.load(std::memory_order_relaxed),
+                "fifo::patch_u32: offset {} is below the published watermark", offset);
   const auto out = bswap(val);
   std::memcpy(detail::sBufferData + offset, &out, sizeof(out));
 }
@@ -100,8 +253,8 @@ void begin_display_list(uint8_t* buf, uint32_t size) {
 
 uint32_t end_display_list() {
   detail::sInDisplayList = false;
-  uint32_t bytesWritten = detail::sDlWritePos;
-  uint32_t padded = (bytesWritten + 31) & ~31u;
+  const uint32_t bytesWritten = detail::sDlWritePos;
+  const uint32_t padded = (bytesWritten + 31) & ~31u;
   while (detail::sDlWritePos < padded && detail::sDlWritePos < detail::sDlSize) {
     detail::sDlBuffer[detail::sDlWritePos++] = 0;
   }
@@ -117,12 +270,50 @@ void drain() {
   if (detail::sBufferSize == 0) {
     return;
   }
-  process(detail::sBufferData, detail::sBufferSize, true);
-  detail::sBufferSize = 0;
+
+  ZoneScoped;
+  const uint64_t target = sStreamBase + detail::sBufferSize;
+
+  switch (kProcessingMode) {
+  case ProcessingMode::Drain:
+  case ProcessingMode::Inline:
+    sPublished.store(target, std::memory_order_relaxed);
+    process_to(target, std::memory_order_relaxed);
+    break;
+  case ProcessingMode::Thread: {
+    sPublished.store(target, std::memory_order_release);
+    wake_worker();
+
+    uint64_t processed = sProcessed.load(std::memory_order_acquire);
+    if (processed < target) {
+      do {
+        sProcessed.wait(processed, std::memory_order_acquire);
+        processed = sProcessed.load(std::memory_order_acquire);
+      } while (processed < target);
+    }
+    break;
+  }
+  }
+
+  {
+    std::lock_guard lock{sBufferMutex};
+    sStreamBase = target;
+    detail::sBufferSize = 0;
+  }
+  sPendingDraws = 0;
 }
 
 const uint8_t* get_buffer_data() { return detail::sBufferData; }
 uint32_t get_buffer_size() { return detail::sBufferSize; }
-void clear_buffer() { detail::sBufferSize = 0; }
+
+void clear_buffer() {
+  const uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  AURORA_ASSERT(sPublished.load(std::memory_order_acquire) == processed,
+                "fifo::clear_buffer: published commands are still pending");
+  std::lock_guard lock{sBufferMutex};
+  sStreamBase = processed;
+  detail::sBufferSize = 0;
+  sPendingDraws = 0;
+}
 
 } // namespace aurora::gx::fifo

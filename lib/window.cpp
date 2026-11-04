@@ -29,14 +29,17 @@ extern "C" void Android_UnlockActivityMutex(void);
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
+#include <string>
 #include <vector>
 
 #include "rmlui.hpp"
+#include "time_internal.hpp"
 #include "dolphin/vi/vi_internal.hpp"
 
 namespace aurora::window {
 namespace {
-Module Log("aurora::window");
+constexpr Module Log{"aurora::window"};
 
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
@@ -44,6 +47,7 @@ float g_frameBufferScale = 0.f;
 bool g_frameBufferAspectFit = false;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
+std::deque<std::string> g_eventStrings;
 std::atomic_bool g_backgrounded = false;
 #if defined(SDL_PLATFORM_ANDROID)
 std::atomic_bool g_surfaceReady = false;
@@ -52,6 +56,27 @@ std::atomic_bool g_surfaceReady = true;
 #endif
 bool g_lastPaused = false;
 bool g_gotFocus = false;
+
+void retain_event_strings(SDL_Event& event) {
+  switch (event.type) {
+  case SDL_EVENT_DROP_BEGIN:
+  case SDL_EVENT_DROP_FILE:
+  case SDL_EVENT_DROP_TEXT:
+  case SDL_EVENT_DROP_COMPLETE:
+  case SDL_EVENT_DROP_POSITION:
+    break;
+  default:
+    return;
+  }
+  if (event.drop.source != nullptr) {
+    g_eventStrings.emplace_back(event.drop.source);
+    event.drop.source = g_eventStrings.back().c_str();
+  }
+  if (event.drop.data != nullptr) {
+    g_eventStrings.emplace_back(event.drop.data);
+    event.drop.data = g_eventStrings.back().c_str();
+  }
+}
 
 bool operator==(const AuroraWindowSize& lhs, const AuroraWindowSize& rhs) {
   return lhs.width == rhs.width && lhs.height == rhs.height && lhs.fb_width == rhs.fb_width &&
@@ -110,23 +135,32 @@ void set_window_icon() noexcept {
       SDL_CreateSurfaceFrom(static_cast<int>(g_config.iconWidth), static_cast<int>(g_config.iconHeight),
                             SDL_GetPixelFormatForMasks(32, 0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000),
                             g_config.iconRGBA8, static_cast<int>(4 * g_config.iconWidth));
-  ASSERT(iconSurface != nullptr, "Failed to create icon surface: {}", SDL_GetError());
+  AURORA_ASSERT(iconSurface != nullptr, "Failed to create icon surface: {}", SDL_GetError());
   TRY_WARN(SDL_SetWindowIcon(g_window, iconSurface), "Failed to set window icon: {}", SDL_GetError());
   SDL_DestroySurface(iconSurface);
 }
 
+bool targets_primary_window(const SDL_Event* event) noexcept {
+  const SDL_Window* eventWindow = SDL_GetWindowFromEvent(event);
+  return eventWindow == nullptr || eventWindow == g_window;
+}
+
 bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
-  switch (event->type) {
+  if (targets_primary_window(event)) {
+    switch (event->type) {
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_APPLE)
-  case SDL_EVENT_WINDOW_MINIMIZED:
-    g_backgrounded.store(true, std::memory_order_relaxed);
-    break;
-  case SDL_EVENT_WINDOW_RESTORED:
-    g_backgrounded.store(false, std::memory_order_relaxed);
-    break;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+      time::internal::set_pause_reason(time::internal::PauseReason::Background, true);
+      g_backgrounded.store(true, std::memory_order_relaxed);
+      break;
+    case SDL_EVENT_WINDOW_RESTORED:
+      g_backgrounded.store(false, std::memory_order_relaxed);
+      time::internal::set_pause_reason(time::internal::PauseReason::Background, false);
+      break;
 #endif
-  default:
-    break;
+    default:
+      break;
+    }
   }
   return true;
 }
@@ -137,21 +171,28 @@ void sync_paused() {
     return;
   }
   g_lastPaused = paused;
+  time::internal::set_pause_reason(time::internal::PauseReason::Window, paused);
   g_events.push_back(AuroraEvent{
       .type = paused ? AURORA_PAUSED : AURORA_UNPAUSED,
   });
 }
 
 void process_event(SDL_Event& event) {
+  const bool primaryWindow = targets_primary_window(&event);
+  if (primaryWindow) {
 #ifdef AURORA_ENABLE_GX
-  imgui::process_event(event);
+    imgui::process_event(event);
 #endif
 #ifdef AURORA_ENABLE_RMLUI
-  rmlui::handle_event(event);
+    rmlui::handle_event(event);
 #endif
+  }
 
   switch (event.type) {
   case SDL_EVENT_WINDOW_MOVED: {
+    if (!primaryWindow) {
+      break;
+    }
     g_events.push_back(AuroraEvent{
         .type = AURORA_WINDOW_MOVED,
         .windowPos = {.x = event.window.data1, .y = event.window.data2},
@@ -159,6 +200,9 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
+    if (!primaryWindow) {
+      break;
+    }
     resize_swapchain();
     g_events.push_back(AuroraEvent{
         .type = AURORA_DISPLAY_SCALE_CHANGED,
@@ -167,6 +211,9 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+    if (!primaryWindow) {
+      break;
+    }
     resize_swapchain();
     g_events.push_back(AuroraEvent{
         .type = AURORA_WINDOW_RESIZED,
@@ -191,7 +238,16 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_MOUSE_WHEEL:
-    input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+    if (primaryWindow) {
+      input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+    }
+    break;
+  case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+    if (primaryWindow) {
+      g_events.push_back(AuroraEvent{
+          .type = AURORA_EXIT,
+      });
+    }
     break;
   case SDL_EVENT_QUIT:
     g_events.push_back(AuroraEvent{
@@ -215,7 +271,10 @@ void process_event(SDL_Event& event) {
     break;
   }
 
-  sync_paused();
+  if (primaryWindow) {
+    sync_paused();
+  }
+  retain_event_strings(event);
   g_events.push_back(AuroraEvent{
       .type = AURORA_SDL_EVENT,
       .sdl = event,
@@ -226,6 +285,7 @@ void process_event(SDL_Event& event) {
 const AuroraEvent* poll_events() {
   ZoneScoped;
   g_events.clear();
+  g_eventStrings.clear();
 
   SDL_Event event;
   // Clear out the previous scroll values to prevent ghost input
@@ -350,6 +410,8 @@ bool initialize() {
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
+  time::internal::set_pause_reason(time::internal::PauseReason::Surface,
+                                   !g_surfaceReady.load(std::memory_order_acquire));
 
 #if !defined(_WIN32) && !defined(__APPLE__)
   TRY(SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0"), "Error setting {}: {}",
@@ -386,8 +448,8 @@ AuroraWindowSize get_window_size() {
   int height = 0;
   int native_fb_w = 0;
   int native_fb_h = 0;
-  ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
-  ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
+  AURORA_ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
+  AURORA_ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
 
   int fb_w = native_fb_w;
@@ -447,7 +509,10 @@ bool is_presentable() noexcept {
          g_surfaceReady.load(std::memory_order_acquire);
 }
 
-void set_surface_ready(bool ready) noexcept { g_surfaceReady.store(ready, std::memory_order_release); }
+void set_surface_ready(bool ready) noexcept {
+  g_surfaceReady.store(ready, std::memory_order_release);
+  time::internal::set_pause_reason(time::internal::PauseReason::Surface, !ready);
+}
 
 SurfaceLock::SurfaceLock() noexcept {
 #if defined(SDL_PLATFORM_ANDROID)
@@ -527,8 +592,8 @@ void set_background_input(bool value) { SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACK
 } // namespace aurora::window
 
 #if defined(SDL_PLATFORM_ANDROID)
-extern "C" JNIEXPORT void JNICALL Java_org_libsdl_app_SDLSurface_auroraNativeSetSurfaceReady(JNIEnv*, jclass,
-                                                                                             jboolean ready) {
+extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeSetSurfaceReady(JNIEnv*, jclass,
+                                                                                                jboolean ready) {
   aurora::window::set_surface_ready(ready == JNI_TRUE);
 }
 #endif
